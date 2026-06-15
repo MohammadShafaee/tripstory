@@ -109,60 +109,38 @@ async function createStory({
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const imageInputs = await Promise.all(
     files.map(async (file, index) => ({
-      type: "input_image" as const,
-      image_url: `data:${file.mimetype};base64,${await fs.readFile(file.path, "base64")}`,
-      detail: index < 6 ? ("high" as const) : ("low" as const)
+      type: "image_url" as const,
+      image_url: {
+        url: `data:${file.mimetype};base64,${await fs.readFile(file.path, "base64")}`,
+        detail: index < 6 ? ("high" as const) : ("low" as const)
+      }
     }))
   );
 
-  const response = await client.responses.create({
+  const response = await client.chat.completions.create({
     model: OPENAI_MODEL,
-    input: [
-      {
-        role: "system",
-        content:
-          "You are Tripstory, an excellent travel essayist. You turn a small batch of trip photos into a vivid, truthful, short narrative. Do not invent specific names, dialogue, venues, or events unless visible in the photos. Write with a distinct voice, but keep it grounded."
-      },
+    messages: [
       {
         role: "user",
         content: [
           {
-            type: "input_text",
+            type: "text",
             text: [
+              "You are Tripstory, an excellent travel essayist. You turn a small batch of trip photos into a vivid, truthful, short narrative. Do not invent specific names, dialogue, venues, or events unless visible in the photos. Write with a distinct voice, but keep it grounded.",
               `Trip name: ${tripName}`,
               `Desired voice: ${tone}`,
               "Write a title, a 450-700 word narrative, and 4-8 short scene captions for a vertical recap video.",
-              "Return strict JSON with keys: title, narrative, sceneCaptions."
+              "Return ONLY valid JSON with keys: title, narrative, sceneCaptions."
             ].join("\n")
           },
           ...imageInputs
         ]
       }
     ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: "tripstory_story",
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          required: ["title", "narrative", "sceneCaptions"],
-          properties: {
-            title: { type: "string" },
-            narrative: { type: "string" },
-            sceneCaptions: {
-              type: "array",
-              minItems: 4,
-              maxItems: 8,
-              items: { type: "string" }
-            }
-          }
-        }
-      }
-    }
+    response_format: { type: "json_object" }
   });
 
-  const raw = response.output_text;
+  const raw = response.choices[0]?.message.content || "{}";
   const parsed = JSON.parse(raw) as StoryPayload;
   return {
     title: parsed.title.trim(),
@@ -201,10 +179,14 @@ async function renderSlideshowVideo({
   await fs.mkdir(jobDir, { recursive: true });
 
   const selectedFiles = files.slice(0, Math.min(files.length, 8));
+  console.log("Selected files for job:", selectedFiles.map((f) => ({ path: f.path, mimetype: f.mimetype, size: f.size })));
   const listPath = path.join(jobDir, "inputs.txt");
   const concatLines: string[] = [];
 
   for (const [index, file] of selectedFiles.entries()) {
+    if (!file.mimetype.startsWith("image/")) {
+      throw new Error(`Unsupported file type for slideshow: ${file.mimetype} at ${file.path}`);
+    }
     const slidePath = path.join(jobDir, `slide-${index}.mp4`);
     const caption = story.sceneCaptions[index % story.sceneCaptions.length] ?? story.title;
     await createSlide(file.path, slidePath, caption);
@@ -243,11 +225,17 @@ async function createSlide(inputPath: string, outputPath: string, caption: strin
     "-loop",
     "1",
     "-t",
-    "3.2",
+    "1.5",
     "-i",
     inputPath,
     "-vf",
     filter,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "28",
     "-r",
     "30",
     "-pix_fmt",
@@ -260,13 +248,26 @@ function runFfmpeg(args: string[]) {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(ffmpeg.path, args, { windowsHide: true });
     let stderr = "";
+    let stdout = "";
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error(`ffmpeg timeout after 60 seconds (args: ${args.join(" ")})`));
+    }, 60000);
 
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
 
-    child.on("error", reject);
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
     child.on("close", (code) => {
+      clearTimeout(timeout);
       if (code === 0) {
         resolve();
         return;
@@ -289,7 +290,8 @@ async function main() {
   await fs.mkdir(UPLOAD_DIR, { recursive: true });
   await fs.mkdir(GENERATED_DIR, { recursive: true });
 
-  app.listen(PORT, () => {
+  // Bind to 0.0.0.0 so the API is reachable from other devices on the LAN
+  app.listen(PORT, "0.0.0.0", () => {
     console.log(`Tripstory API listening on ${PUBLIC_BASE_URL}`);
   });
 }

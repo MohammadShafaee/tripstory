@@ -1,5 +1,5 @@
-import { Video, ResizeMode } from "expo-av";
 import * as ImagePicker from "expo-image-picker";
+import * as ImageManipulator from "expo-image-manipulator";
 import React, { useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -8,16 +8,16 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View
 } from "react-native";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 
 const MAX_PHOTOS = 20;
-const API_URL = "http://localhost:4000";
+const DEFAULT_API_URL = "http://192.168.1.166:4000";
 
 type PickedPhoto = {
   uri: string;
@@ -34,6 +34,7 @@ type StoryResult = {
 export default function App() {
   const [tripName, setTripName] = useState("Rome weekend");
   const [tone, setTone] = useState("witty, cinematic, observational");
+  const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
   const [photos, setPhotos] = useState<PickedPhoto[]>([]);
   const [result, setResult] = useState<StoryResult | null>(null);
   const [isGenerating, setGenerating] = useState(false);
@@ -55,12 +56,21 @@ export default function App() {
       return;
     }
 
-    const picked = await ImagePicker.launchImageLibraryAsync({
+    // Prefer the new ImagePicker.MediaType API; avoid using deprecated MediaTypeOptions
+    const mediaTypesAny = (ImagePicker as any).MediaType;
+    const mediaTypesOption = mediaTypesAny ? mediaTypesAny.Images : undefined;
+
+    const launchOptions: any = {
       allowsMultipleSelection: true,
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
       quality: 0.82,
       selectionLimit: remainingSlots
-    });
+    };
+
+    if (mediaTypesOption) {
+      launchOptions.mediaTypes = mediaTypesOption;
+    }
+
+    const picked = await ImagePicker.launchImageLibraryAsync(launchOptions);
 
     if (picked.canceled) {
       return;
@@ -93,37 +103,71 @@ export default function App() {
       form.append("tripName", tripName.trim());
       form.append("tone", tone.trim());
 
-      photos.forEach((photo, index) => {
-        const extension = photo.mimeType?.includes("png") ? "png" : "jpg";
+      for (const [index, photo] of photos.entries()) {
+        const isHeic = (photo.mimeType ?? "").includes("heic") || photo.uri.toLowerCase().endsWith(".heic");
+        let uploadUri = photo.uri;
+        let uploadType = photo.mimeType ?? "image/jpeg";
+        let uploadName = photo.fileName ?? `trip-photo-${index + 1}`;
+
+        if (isHeic) {
+          try {
+            const converted = await ImageManipulator.manipulateAsync(photo.uri, [], {
+              compress: 0.9,
+              format: ImageManipulator.SaveFormat.JPEG
+            });
+            uploadUri = converted.uri;
+            uploadType = "image/jpeg";
+            uploadName = `${uploadName}.jpg`;
+          } catch (e) {
+            console.warn("HEIC conversion failed, uploading original:", e);
+          }
+        } else {
+          const extension = photo.mimeType?.includes("png") ? "png" : "jpg";
+          uploadName = uploadName.includes(".") ? uploadName : `${uploadName}.${extension}`;
+        }
+
         form.append("photos", {
-          uri: photo.uri,
-          name: photo.fileName ?? `trip-photo-${index + 1}.${extension}`,
-          type: photo.mimeType ?? "image/jpeg"
+          uri: uploadUri,
+          name: uploadName,
+          type: uploadType
         } as unknown as Blob);
-      });
-
-      const response = await fetch(`${API_URL}/api/stories`, {
-        method: "POST",
-        body: form
-      });
-
-      if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || "Story generation failed.");
       }
 
-      const payload = (await response.json()) as StoryResult;
-      setResult(payload);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Something went wrong.";
-      Alert.alert("Could not create story", message);
-    } finally {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000);
+
+      try {
+        const response = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/stories`, {
+          method: "POST",
+          body: form,
+          signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || "Story generation failed.");
+        }
+
+        const payload = (await response.json()) as StoryResult;
+        setResult(payload);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Something went wrong.";
+        Alert.alert("Could not create story", message);
+      } finally {
+        setGenerating(false);
+      }
+    } catch (outerError) {
+      const message = outerError instanceof Error ? outerError.message : "Something went wrong.";
+      Alert.alert("Error", message);
       setGenerating(false);
     }
   }
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.safeArea}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.container}>
         <ScrollView contentContainerStyle={styles.content}>
           <View style={styles.header}>
@@ -149,6 +193,16 @@ export default function App() {
               onChangeText={setTone}
               placeholder="warm, witty, deadpan..."
               style={styles.input}
+            />
+
+            <Text style={styles.label}>API URL</Text>
+            <TextInput
+              value={apiUrl}
+              onChangeText={setApiUrl}
+              placeholder={DEFAULT_API_URL}
+              style={styles.input}
+              autoCapitalize="none"
+              autoCorrect={false}
             />
           </View>
 
@@ -193,17 +247,25 @@ export default function App() {
             <View style={styles.result}>
               <Text style={styles.resultTitle}>{result.title}</Text>
               <Text style={styles.narrative}>{result.narrative}</Text>
-              <Video
-                source={{ uri: result.videoUrl }}
-                style={styles.video}
-                useNativeControls
-                resizeMode={ResizeMode.CONTAIN}
-              />
+              <Pressable 
+                style={[styles.primaryButton, {marginTop: 16}]}
+                onPress={() => {
+                  // Try to open video in browser or media player
+                  const Linking = require("react-native").Linking;
+                  Linking.openURL(result.videoUrl);
+                }}
+              >
+                <Text style={styles.primaryButtonText}>📹 Play video</Text>
+              </Pressable>
+              <Text style={{color: '#666', fontSize: 12, marginTop: 12, textAlign: 'center'}}>
+                Video URL: {result.videoUrl}
+              </Text>
             </View>
           )}
         </ScrollView>
       </KeyboardAvoidingView>
-    </SafeAreaView>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 

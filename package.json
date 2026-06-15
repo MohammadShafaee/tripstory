@@ -16,12 +16,15 @@
     "dotenv": "^16.4.7",
     "expo": "^54.0.0",
     "expo-av": "^16.0.0",
+    "expo-image-manipulator": "^56.0.19",
     "expo-image-picker": "^17.0.0",
+    "expo-video": "^56.1.4",
     "express": "^4.21.2",
     "multer": "^1.4.5-lts.1",
     "openai": "^6.9.1",
     "react": "19.1.0",
     "react-native": "0.81.5",
+    "react-native-safe-area-context": "^5.8.0",
     "tsx": "^4.19.2"
   },
   "devDependencies": {
